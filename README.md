@@ -1,6 +1,7 @@
 # Greener Reporter - Go
 Tool to report Go test results to [Greener](https://github.com/cephei8/greener).
 
+
 ## Contributing
 See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
