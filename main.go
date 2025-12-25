@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/urfave/cli/v3"
 )
@@ -104,19 +105,23 @@ func main() {
 }
 
 type Reporter struct {
-	endpoint  string
-	apiKey    string
-	sessionID string
-	client    *http.Client
-	results   map[string]*TestResult
+	endpoint    string
+	apiKey      string
+	sessionID   string
+	client      *http.Client
+	results     map[string]*TestResult
+	resultsChan chan *TestResult
+	batcherDone chan struct{}
 }
 
 func NewReporter(endpoint, apiKey string) *Reporter {
 	return &Reporter{
-		endpoint: strings.TrimSuffix(endpoint, "/"),
-		apiKey:   apiKey,
-		client:   &http.Client{},
-		results:  make(map[string]*TestResult),
+		endpoint:    strings.TrimSuffix(endpoint, "/"),
+		apiKey:      apiKey,
+		client:      &http.Client{},
+		results:     make(map[string]*TestResult),
+		resultsChan: make(chan *TestResult),
+		batcherDone: make(chan struct{}),
 	}
 }
 
@@ -130,7 +135,9 @@ func (r *Reporter) createSession() error {
 		return fmt.Errorf("marshal session request: %w", err)
 	}
 
-	httpReq, err := http.NewRequest("POST", r.endpoint+"/api/v1/ingress/sessions", bytes.NewReader(body))
+	httpReq, err := http.NewRequest(
+		"POST", r.endpoint+"/api/v1/ingress/sessions", bytes.NewReader(body),
+	)
 	if err != nil {
 		return fmt.Errorf("create session request: %w", err)
 	}
@@ -146,7 +153,11 @@ func (r *Reporter) createSession() error {
 
 	if resp.StatusCode != http.StatusCreated {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("create session failed: status=%d body=%s", resp.StatusCode, string(bodyBytes))
+		return fmt.Errorf(
+			"create session failed: status=%d body=%s",
+			resp.StatusCode,
+			string(bodyBytes),
+		)
 	}
 
 	var sessionResp SessionResponse
@@ -159,22 +170,9 @@ func (r *Reporter) createSession() error {
 	return nil
 }
 
-func (r *Reporter) submitResults() error {
-	if len(r.results) == 0 {
-		log.Println("No test results to submit")
+func (r *Reporter) submitBatch(testcases []TestcaseRequest) error {
+	if len(testcases) == 0 {
 		return nil
-	}
-
-	var testcases []TestcaseRequest
-	for _, result := range r.results {
-		testcases = append(testcases, TestcaseRequest{
-			SessionId:         r.sessionID,
-			TestcaseName:      result.Test,
-			TestcaseClassname: result.Package,
-			Testsuite:         result.Package,
-			Status:            result.Status,
-			Output:            result.Output.String(),
-		})
 	}
 
 	req := TestcasesRequest{
@@ -186,7 +184,9 @@ func (r *Reporter) submitResults() error {
 		return fmt.Errorf("marshal testcases request: %w", err)
 	}
 
-	httpReq, err := http.NewRequest("POST", r.endpoint+"/api/v1/ingress/testcases", bytes.NewReader(body))
+	httpReq, err := http.NewRequest(
+		"POST", r.endpoint+"/api/v1/ingress/testcases", bytes.NewReader(body),
+	)
 	if err != nil {
 		return fmt.Errorf("create testcases request: %w", err)
 	}
@@ -202,11 +202,57 @@ func (r *Reporter) submitResults() error {
 
 	if resp.StatusCode != http.StatusCreated {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("submit testcases failed: status=%d body=%s", resp.StatusCode, string(bodyBytes))
+		return fmt.Errorf(
+			"submit testcases failed: status=%d body=%s",
+			resp.StatusCode,
+			string(bodyBytes),
+		)
 	}
 
 	log.Printf("Submitted %d test results\n", len(testcases))
 	return nil
+}
+
+func (r *Reporter) batch() {
+	defer close(r.batcherDone)
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	var batch []TestcaseRequest
+
+	submit := func() {
+		if err := r.submitBatch(batch); err != nil {
+			log.Printf("Error submitting batch: %v\n", err)
+		}
+		batch = nil
+	}
+
+	for {
+		select {
+		case result, ok := <-r.resultsChan:
+			if !ok {
+				submit()
+				return
+			}
+
+			batch = append(batch, TestcaseRequest{
+				SessionId:         r.sessionID,
+				TestcaseName:      result.Test,
+				TestcaseClassname: result.Package,
+				Testsuite:         result.Package,
+				Status:            result.Status,
+				Output:            result.Output.String(),
+			})
+
+			if len(batch) >= 100 {
+				submit()
+			}
+
+		case <-ticker.C:
+			submit()
+		}
+	}
 }
 
 func (r *Reporter) handleEvent(ev Event) {
@@ -216,47 +262,31 @@ func (r *Reporter) handleEvent(ev Event) {
 
 	key := ev.Package + "/" + ev.Test
 
-	switch ev.Action {
-	case actionRun:
+	result, ok := r.results[key]
+	if !ok && ev.Action != actionOutput {
 		r.results[key] = &TestResult{
 			Package: ev.Package,
 			Test:    ev.Test,
 			Status:  statusError,
 		}
+	}
+
+	switch ev.Action {
+	case actionRun:
 	case actionPass:
-		if result, ok := r.results[key]; ok {
-			result.Status = statusPass
-		} else {
-			r.results[key] = &TestResult{
-				Package: ev.Package,
-				Test:    ev.Test,
-				Status:  statusPass,
-			}
-		}
+		result.Status = statusPass
+		r.resultsChan <- result
+		delete(r.results, key)
 	case actionFail:
-		if result, ok := r.results[key]; ok {
-			result.Status = statusFail
-		} else {
-			r.results[key] = &TestResult{
-				Package: ev.Package,
-				Test:    ev.Test,
-				Status:  statusFail,
-			}
-		}
+		result.Status = statusFail
+		r.resultsChan <- result
+		delete(r.results, key)
 	case actionSkip:
-		if result, ok := r.results[key]; ok {
-			result.Status = statusSkip
-		} else {
-			r.results[key] = &TestResult{
-				Package: ev.Package,
-				Test:    ev.Test,
-				Status:  statusSkip,
-			}
-		}
+		result.Status = statusSkip
+		r.resultsChan <- result
+		delete(r.results, key)
 	case actionOutput:
-		if result, ok := r.results[key]; ok {
-			result.Output.WriteString(ev.Output)
-		}
+		result.Output.WriteString(ev.Output)
 	}
 }
 
@@ -269,6 +299,8 @@ func run(ctx context.Context, c *cli.Command) error {
 	if err := reporter.createSession(); err != nil {
 		return fmt.Errorf("create session: %w", err)
 	}
+
+	go reporter.batch()
 
 	dec := json.NewDecoder(os.Stdin)
 	for {
@@ -283,9 +315,8 @@ func run(ctx context.Context, c *cli.Command) error {
 		reporter.handleEvent(ev)
 	}
 
-	if err := reporter.submitResults(); err != nil {
-		return fmt.Errorf("submit results: %w", err)
-	}
+	close(reporter.resultsChan)
+	<-reporter.batcherDone
 
 	return nil
 }
