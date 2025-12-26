@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -28,6 +29,7 @@ const (
 const (
 	ingressEndpointFlag    = "ingress-endpoint"
 	ingressAPIKeyFlag      = "ingress-api-key"
+	inputFileFlag          = "input-file"
 	sessionIDFlag          = "session-id"
 	sessionDescriptionFlag = "session-description"
 	sessionLabelsFlag      = "session-labels"
@@ -108,6 +110,12 @@ func main() {
 				Name:     ingressAPIKeyFlag,
 				Usage:    "Greener ingress API key",
 				Sources:  cli.EnvVars("GREENER_INGRESS_API_KEY"),
+				Required: true,
+			},
+			&cli.StringFlag{
+				Name:     inputFileFlag,
+				Usage:    "Path to Go test JSON output file (use '-' for stdin)",
+				Aliases:  []string{"f"},
 				Required: true,
 			},
 			&cli.StringFlag{
@@ -368,6 +376,7 @@ func (r *Reporter) handleEvent(ev Event) {
 func run(ctx context.Context, c *cli.Command) error {
 	endpoint := c.String(ingressEndpointFlag)
 	apiKey := c.String(ingressAPIKeyFlag)
+	inputFile := c.String(inputFileFlag)
 	sessionID := c.String(sessionIDFlag)
 	sessionDescription := c.String(sessionDescriptionFlag)
 	sessionLabelsStr := c.String(sessionLabelsFlag)
@@ -390,17 +399,36 @@ func run(ctx context.Context, c *cli.Command) error {
 
 	go reporter.batch()
 
-	dec := json.NewDecoder(os.Stdin)
-	for {
+	var reader io.Reader
+	if inputFile == "-" {
+		reader = os.Stdin
+	} else {
+		file, err := os.Open(inputFile)
+		if err != nil {
+			return fmt.Errorf("open file %s: %w", inputFile, err)
+		}
+		defer file.Close()
+		reader = file
+	}
+
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
 		var ev Event
-		if err := dec.Decode(&ev); err != nil {
-			if err.Error() == "EOF" {
-				break
-			}
-			return fmt.Errorf("decode error: %w", err)
+		if err := json.Unmarshal(line, &ev); err != nil {
+			log.Printf("Skipping invalid JSON line: %v", err)
+			continue
 		}
 
 		reporter.handleEvent(ev)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read input: %w", err)
 	}
 
 	close(reporter.resultsChan)
