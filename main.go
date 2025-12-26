@@ -34,6 +34,7 @@ const (
 	sessionDescriptionFlag = "session-description"
 	sessionLabelsFlag      = "session-labels"
 	sessionBaggageFlag     = "session-baggage"
+	verboseFlag            = "verbose"
 )
 
 const (
@@ -138,6 +139,11 @@ func main() {
 				Usage:   "Session baggage (JSON object)",
 				Sources: cli.EnvVars("GREENER_SESSION_BAGGAGE"),
 			},
+			&cli.BoolFlag{
+				Name:    verboseFlag,
+				Usage:   "Enable verbose logging",
+				Aliases: []string{"v"},
+			},
 		},
 		Action: run,
 	}
@@ -154,13 +160,14 @@ type Reporter struct {
 	sessionDescription string
 	sessionLabels      []Label
 	sessionBaggage     map[string]any
+	verbose            bool
 	client             *http.Client
 	results            map[TestResultKey]*TestResult
 	resultsChan        chan *TestResult
 	batcherDone        chan struct{}
 }
 
-func NewReporter(endpoint, apiKey, sessionID, sessionDescription string, sessionLabels []Label, sessionBaggage map[string]any) *Reporter {
+func NewReporter(endpoint, apiKey, sessionID, sessionDescription string, sessionLabels []Label, sessionBaggage map[string]any, verbose bool) *Reporter {
 	return &Reporter{
 		endpoint:           strings.TrimSuffix(endpoint, "/"),
 		apiKey:             apiKey,
@@ -168,6 +175,7 @@ func NewReporter(endpoint, apiKey, sessionID, sessionDescription string, session
 		sessionDescription: sessionDescription,
 		sessionLabels:      sessionLabels,
 		sessionBaggage:     sessionBaggage,
+		verbose:            verbose,
 		client:             &http.Client{},
 		results:            make(map[TestResultKey]*TestResult),
 		resultsChan:        make(chan *TestResult),
@@ -381,6 +389,7 @@ func run(ctx context.Context, c *cli.Command) error {
 	sessionDescription := c.String(sessionDescriptionFlag)
 	sessionLabelsStr := c.String(sessionLabelsFlag)
 	sessionBaggageStr := c.String(sessionBaggageFlag)
+	verbose := c.Bool(verboseFlag)
 
 	sessionLabels := parseLabels(sessionLabelsStr)
 
@@ -391,7 +400,7 @@ func run(ctx context.Context, c *cli.Command) error {
 		}
 	}
 
-	reporter := NewReporter(endpoint, apiKey, sessionID, sessionDescription, sessionLabels, sessionBaggage)
+	reporter := NewReporter(endpoint, apiKey, sessionID, sessionDescription, sessionLabels, sessionBaggage, verbose)
 
 	if err := reporter.createSession(); err != nil {
 		return fmt.Errorf("create session: %w", err)
@@ -420,7 +429,9 @@ func run(ctx context.Context, c *cli.Command) error {
 
 		var ev Event
 		if err := json.Unmarshal(line, &ev); err != nil {
-			log.Printf("Skipping invalid JSON line: %v", err)
+			if reporter.verbose {
+				log.Printf("Skipping invalid JSON line: %v", err)
+			}
 			continue
 		}
 
