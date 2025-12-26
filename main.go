@@ -26,8 +26,12 @@ const (
 )
 
 const (
-	ingressEndpointFlag = "ingress-endpoint"
-	ingressAPIKeyFlag   = "ingress-api-key"
+	ingressEndpointFlag    = "ingress-endpoint"
+	ingressAPIKeyFlag      = "ingress-api-key"
+	sessionIDFlag          = "session-id"
+	sessionDescriptionFlag = "session-description"
+	sessionLabelsFlag      = "session-labels"
+	sessionBaggageFlag     = "session-baggage"
 )
 
 const (
@@ -46,9 +50,15 @@ type Event struct {
 	Elapsed float64    `json:"Elapsed,omitempty"`
 }
 
+type Label struct {
+	Key   string `json:"key"`
+	Value string `json:"value,omitempty"`
+}
+
 type SessionRequest struct {
 	Id          string         `json:"id,omitempty"`
 	Description string         `json:"description,omitempty"`
+	Labels      []Label        `json:"labels,omitempty"`
 	Baggage     map[string]any `json:"baggage,omitempty"`
 }
 
@@ -69,6 +79,11 @@ type TestcaseRequest struct {
 
 type TestcasesRequest struct {
 	Testcases []TestcaseRequest `json:"testcases"`
+}
+
+type TestResultKey struct {
+	Package string
+	Test    string
 }
 
 type TestResult struct {
@@ -95,6 +110,26 @@ func main() {
 				Sources:  cli.EnvVars("GREENER_INGRESS_API_KEY"),
 				Required: true,
 			},
+			&cli.StringFlag{
+				Name:    sessionIDFlag,
+				Usage:   "Session ID (optional, will be generated if not provided)",
+				Sources: cli.EnvVars("GREENER_SESSION_ID"),
+			},
+			&cli.StringFlag{
+				Name:    sessionDescriptionFlag,
+				Usage:   "Session description",
+				Sources: cli.EnvVars("GREENER_SESSION_DESCRIPTION"),
+			},
+			&cli.StringFlag{
+				Name:    sessionLabelsFlag,
+				Usage:   "Session labels (comma-separated, e.g. 'ci,tag=value')",
+				Sources: cli.EnvVars("GREENER_SESSION_LABELS"),
+			},
+			&cli.StringFlag{
+				Name:    sessionBaggageFlag,
+				Usage:   "Session baggage (JSON object)",
+				Sources: cli.EnvVars("GREENER_SESSION_BAGGAGE"),
+			},
 		},
 		Action: run,
 	}
@@ -105,29 +140,65 @@ func main() {
 }
 
 type Reporter struct {
-	endpoint    string
-	apiKey      string
-	sessionID   string
-	client      *http.Client
-	results     map[string]*TestResult
-	resultsChan chan *TestResult
-	batcherDone chan struct{}
+	endpoint           string
+	apiKey             string
+	sessionID          string
+	sessionDescription string
+	sessionLabels      []Label
+	sessionBaggage     map[string]any
+	client             *http.Client
+	results            map[TestResultKey]*TestResult
+	resultsChan        chan *TestResult
+	batcherDone        chan struct{}
 }
 
-func NewReporter(endpoint, apiKey string) *Reporter {
+func NewReporter(endpoint, apiKey, sessionID, sessionDescription string, sessionLabels []Label, sessionBaggage map[string]any) *Reporter {
 	return &Reporter{
-		endpoint:    strings.TrimSuffix(endpoint, "/"),
-		apiKey:      apiKey,
-		client:      &http.Client{},
-		results:     make(map[string]*TestResult),
-		resultsChan: make(chan *TestResult),
-		batcherDone: make(chan struct{}),
+		endpoint:           strings.TrimSuffix(endpoint, "/"),
+		apiKey:             apiKey,
+		sessionID:          sessionID,
+		sessionDescription: sessionDescription,
+		sessionLabels:      sessionLabels,
+		sessionBaggage:     sessionBaggage,
+		client:             &http.Client{},
+		results:            make(map[TestResultKey]*TestResult),
+		resultsChan:        make(chan *TestResult),
+		batcherDone:        make(chan struct{}),
 	}
+}
+
+func parseLabels(labelsStr string) []Label {
+	if labelsStr == "" {
+		return nil
+	}
+
+	var labels []Label
+	for _, labelStr := range strings.Split(labelsStr, ",") {
+		labelStr = strings.TrimSpace(labelStr)
+		if labelStr == "" {
+			continue
+		}
+
+		if idx := strings.Index(labelStr, "="); idx != -1 {
+			labels = append(labels, Label{
+				Key:   labelStr[:idx],
+				Value: labelStr[idx+1:],
+			})
+		} else {
+			labels = append(labels, Label{
+				Key: labelStr,
+			})
+		}
+	}
+	return labels
 }
 
 func (r *Reporter) createSession() error {
 	req := SessionRequest{
-		Description: "Go test run",
+		Id:          r.sessionID,
+		Description: r.sessionDescription,
+		Labels:      r.sessionLabels,
+		Baggage:     r.sessionBaggage,
 	}
 
 	body, err := json.Marshal(req)
@@ -260,15 +331,19 @@ func (r *Reporter) handleEvent(ev Event) {
 		return
 	}
 
-	key := ev.Package + "/" + ev.Test
+	key := TestResultKey{
+		Package: ev.Package,
+		Test:    ev.Test,
+	}
 
 	result, ok := r.results[key]
 	if !ok && ev.Action != actionOutput {
-		r.results[key] = &TestResult{
+		result = &TestResult{
 			Package: ev.Package,
 			Test:    ev.Test,
 			Status:  statusError,
 		}
+		r.results[key] = result
 	}
 
 	switch ev.Action {
@@ -293,8 +368,21 @@ func (r *Reporter) handleEvent(ev Event) {
 func run(ctx context.Context, c *cli.Command) error {
 	endpoint := c.String(ingressEndpointFlag)
 	apiKey := c.String(ingressAPIKeyFlag)
+	sessionID := c.String(sessionIDFlag)
+	sessionDescription := c.String(sessionDescriptionFlag)
+	sessionLabelsStr := c.String(sessionLabelsFlag)
+	sessionBaggageStr := c.String(sessionBaggageFlag)
 
-	reporter := NewReporter(endpoint, apiKey)
+	sessionLabels := parseLabels(sessionLabelsStr)
+
+	var sessionBaggage map[string]any
+	if sessionBaggageStr != "" {
+		if err := json.Unmarshal([]byte(sessionBaggageStr), &sessionBaggage); err != nil {
+			return fmt.Errorf("parse session baggage: %w", err)
+		}
+	}
+
+	reporter := NewReporter(endpoint, apiKey, sessionID, sessionDescription, sessionLabels, sessionBaggage)
 
 	if err := reporter.createSession(); err != nil {
 		return fmt.Errorf("create session: %w", err)
