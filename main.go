@@ -342,7 +342,7 @@ func (r *Reporter) batch() {
 	}
 }
 
-func (r *Reporter) handleEvent(ev Event) {
+func (r *Reporter) handleEvent(ev Event, verbose bool) {
 	if ev.Test == "" {
 		return
 	}
@@ -353,13 +353,20 @@ func (r *Reporter) handleEvent(ev Event) {
 	}
 
 	result, ok := r.results[key]
-	if !ok && ev.Action != actionOutput {
-		result = &TestResult{
-			Package: ev.Package,
-			Test:    ev.Test,
-			Status:  statusError,
+	if !ok {
+		if ev.Action == actionOutput {
+			if verbose {
+				log.Printf("Skipping output for unknown test result")
+			}
+			return
+		} else {
+			result = &TestResult{
+				Package: ev.Package,
+				Test:    ev.Test,
+				Status:  statusError,
+			}
+			r.results[key] = result
 		}
-		r.results[key] = result
 	}
 
 	switch ev.Action {
@@ -435,7 +442,7 @@ func run(ctx context.Context, c *cli.Command) error {
 			continue
 		}
 
-		reporter.handleEvent(ev)
+		reporter.handleEvent(ev, reporter.verbose)
 	}
 
 	if err := scanner.Err(); err != nil {
